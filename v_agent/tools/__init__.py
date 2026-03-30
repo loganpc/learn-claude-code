@@ -1,5 +1,6 @@
 # v_agent/tools/__init__.py
 from .base import run_bash, run_read, run_write, run_edit, run_list_dir
+from .http import run_http_request
 
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
@@ -7,6 +8,9 @@ TOOL_HANDLERS = {
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "list_dir":   lambda **kw: run_list_dir(kw.get("path", ".")),
+    "http_request": lambda **kw: run_http_request(
+        kw["method"], kw["url"], kw.get("headers"), kw.get("body"), kw.get("timeout", 30)
+    ),
 }
 
 TOOLS = [
@@ -20,4 +24,12 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "list_dir", "description": "List directory contents.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string", "description": "Directory path, defaults to current dir"}}}},
+    {"name": "http_request", "description": "Make an HTTP request.",
+     "input_schema": {"type": "object", "properties": {
+         "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"]},
+         "url": {"type": "string"},
+         "headers": {"type": "object", "description": "Request headers"},
+         "body": {"type": "string", "description": "Request body"},
+         "timeout": {"type": "integer", "description": "Timeout in seconds, default 30"}
+     }, "required": ["method", "url"]}},
 ]
