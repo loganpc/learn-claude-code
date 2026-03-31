@@ -1,5 +1,4 @@
-.agent/config.json
-.agent/transcripts/
+.v-agent/
 __pycache__/
 *.pyc
 .venv/

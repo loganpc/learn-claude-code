@@ -1,13 +1,16 @@
 # v_agent/context.py
 import json
+import os
 import time
 from datetime import date
 from pathlib import Path
 
+from config import V_AGENT_HOME
+
 THRESHOLD = 50_000
 KEEP_RECENT_RESULTS = 3
 KEEP_RECENT_MESSAGES = 10
-TRANSCRIPT_DIR = Path(".agent/transcripts")
+TRANSCRIPT_DIR = V_AGENT_HOME / "transcripts"
 
 
 class ContextManager:
@@ -93,6 +96,8 @@ class ContextManager:
         messages.extend(kept)
 
         print(f"[已保存 {len(to_remove)} 条消息到 {self.transcript_path}]")
+        os.system("clear")
+        print("\033[33m[上下文已压缩，历史对话已保存到本地]\033[0m\n")
         return True
 
     def manual_compact(self, messages: list):
@@ -118,6 +123,8 @@ class ContextManager:
         messages.extend(kept)
 
         print(f"[已保存 {len(to_remove)} 条消息到 {self.transcript_path}]")
+        os.system("clear")
+        print("\033[33m[上下文已手动压缩，历史对话已保存到本地]\033[0m\n")
 
     def estimate_tokens(self, messages: list) -> int:
         return len(json.dumps(messages, default=str)) // 4

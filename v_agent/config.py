@@ -3,8 +3,19 @@ import json
 from pathlib import Path
 from anthropic import Anthropic
 
-CONFIG_DIR = Path(".agent")
-CONFIG_PATH = CONFIG_DIR / "config.json"
+import sys
+
+def _get_app_dir() -> Path:
+    """获取应用所在目录（支持 PyInstaller 打包和源码运行）"""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后，跟随二进制文件位置
+        return Path(sys.executable).parent
+    else:
+        # 源码运行，跟随 CWD
+        return Path.cwd()
+
+V_AGENT_HOME = _get_app_dir() / ".v-agent"
+CONFIG_PATH = V_AGENT_HOME / "config.json"
 
 # 服务商预设
 PROVIDERS = {
@@ -20,22 +31,22 @@ PROVIDERS = {
     },
     "deepseek": {
         "name": "DeepSeek",
-        "base_url": "https://api.deepseek.com",
+        "base_url": "https://api.deepseek.com/anthropic",
         "models": ["deepseek-chat", "deepseek-reasoner"]
     },
     "glm": {
         "name": "智谱 GLM",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "models": ["glm-4-plus", "glm-5"]
+        "base_url": "https://open.bigmodel.cn/api/anthropic",
+        "models": ["glm-4-plus", "glm-5", "glm-4.7"]
     },
     "minimax": {
         "name": "MiniMax",
-        "base_url": "https://api.minimax.chat/v1",
+        "base_url": "https://api.minimaxi.com/anthropic",
         "models": ["MiniMax-M1-80k"]
     },
     "kimi": {
         "name": "Kimi (月之暗面)",
-        "base_url": "https://api.moonshot.cn/v1",
+        "base_url": "https://api.moonshot.cn/anthropic",
         "models": ["kimi-k2.5"]
     },
 }
@@ -43,7 +54,7 @@ PROVIDERS = {
 
 class ModelManager:
     def __init__(self):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        V_AGENT_HOME.mkdir(parents=True, exist_ok=True)
         self.config = self._load_or_create()
         self.current_model = self.config.get("default_model")
         self._client = None
@@ -68,7 +79,8 @@ class ModelManager:
                 if 0 <= choice < len(providers):
                     break
             except (ValueError, EOFError, KeyboardInterrupt):
-                pass
+                print("\n配置已取消")
+                sys.exit(0)
             print("无效选择，请重试")
 
         provider_key, provider = providers[choice]

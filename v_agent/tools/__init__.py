@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .base import run_bash, run_read, run_write, run_edit, run_list_dir
 from .http import run_http_request
+from .api_loader import ApiLoader
 
 
 class SkillLoader:
