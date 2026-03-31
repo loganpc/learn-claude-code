@@ -221,6 +221,9 @@ web/out/
 .vercel
 .env*.local
 test_providers.py
+.idea/
+CLAUDE.md
+docs/
 
 # Internal analysis artifacts (not learning material)
 analysis/
