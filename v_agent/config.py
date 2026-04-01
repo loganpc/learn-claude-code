@@ -66,7 +66,7 @@ class ModelManager:
         return self._interactive_setup()
 
     def _interactive_setup(self) -> dict:
-        config = {"default_model": None, "models": {}, "rag": {"enabled": False, "endpoint": ""}}
+        config = {"default_model": None, "models": {}, "rag": {"enabled": False, "endpoint": ""}, "ak": "vplus:agent:tools:sk:00001"}
 
         providers = list(PROVIDERS.items())
         print("可选服务商:")

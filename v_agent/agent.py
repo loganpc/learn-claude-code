@@ -2,6 +2,7 @@
 """V-Agent: 安全的命令行编程助手"""
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -236,6 +237,11 @@ def main():
     # 初始化
     model_mgr = ModelManager()
     ctx_mgr = ContextManager()
+
+    # 把 config 中的 ak 同步到环境变量，供 API URL 模板使用
+    if "ak" in model_mgr.config:
+        os.environ["AK"] = model_mgr.config["ak"]
+
     skill_loader = SkillLoader(SKILLS_DIR)
 
     # RAG 配置
