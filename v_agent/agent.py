@@ -74,29 +74,139 @@ class CommandCompleter(Completer):
                 yield Completion(cmd, start_position=-len(text), display=display)
 
 
-def _log_request(system_prompt: str, messages: list, model: str):
-    """将发送给模型的完整内容写入调试日志，按小时切割"""
+def _log_request(system_prompt: str, messages: list, model: str,
+                  tools: list, max_tokens: int):
+    """将发送给模型的完整参数写入调试日志，格式化便于查看"""
     if not _debug_enabled:
         return
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     hour_tag = time.strftime("%Y%m%d_%H")
-    log_file = DEBUG_DIR / f"request_{hour_tag}.jsonl"
-    entry = {
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "model": model,
-        "system": system_prompt,
-        "messages": messages,
-    }
+    log_file = DEBUG_DIR / f"request_{hour_tag}.log"
+
+    sep = "=" * 72
+    sub_sep = "-" * 72
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    msg_count = len(messages)
+    token_est = len(json.dumps(messages, default=str)) // 4
+
+    lines = [
+        "",
+        sep,
+        f"  LLM Request  |  {ts}",
+        sep,
+        "",
+        f"[参数]",
+        f"  model:      {model}",
+        f"  max_tokens: {max_tokens}",
+        f"  tools:      {len(tools)} 个 ({', '.join(t['name'] for t in tools)})",
+        f"  messages:   {msg_count} 条 (约 {token_est} tokens)",
+        "",
+        f"[System Prompt]",
+        sub_sep,
+        system_prompt,
+        sub_sep,
+        "",
+        f"[Messages]",
+    ]
+
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "?")
+        content = msg.get("content")
+        lines.append(f"  [{i}] {role}")
+
+        if isinstance(content, str):
+            preview = content if len(content) <= 500 else content[:500] + f"\n    ... ({len(content)} chars total)"
+            for line in preview.splitlines():
+                lines.append(f"    {line}")
+
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    ptype = part.get("type", "?")
+                    tid = part.get("tool_use_id", "")
+                    pcontent = str(part.get("content", ""))
+                    preview = pcontent if len(pcontent) <= 300 else pcontent[:300] + f"... ({len(pcontent)} chars)"
+                    lines.append(f"    [{ptype}] id={tid}")
+                    for line in preview.splitlines():
+                        lines.append(f"      {line}")
+                elif hasattr(part, "type"):
+                    if part.type == "tool_use":
+                        input_str = json.dumps(part.input, ensure_ascii=False, default=str)
+                        if len(input_str) > 300:
+                            input_str = input_str[:300] + f"... ({len(input_str)} chars)"
+                        lines.append(f"    [tool_use] {part.name} id={part.id}")
+                        lines.append(f"      input: {input_str}")
+                    elif part.type == "text":
+                        text = part.text
+                        preview = text if len(text) <= 500 else text[:500] + f"\n      ... ({len(text)} chars total)"
+                        lines.append(f"    [text]")
+                        for line in preview.splitlines():
+                            lines.append(f"      {line}")
+                    else:
+                        lines.append(f"    [{part.type}] {str(part)[:200]}")
+
+        lines.append("")
+
+    lines.append(sep)
+    lines.append("")
+
     with open(log_file, "a") as f:
-        f.write(json.dumps(entry, default=str, ensure_ascii=False) + "\n")
-    print(f"\033[90m[debug] 请求已记录: {log_file}\033[0m")
+        f.write("\n".join(lines))
+    print(f"\033[90m[debug] 请求已记录: {log_file} ({msg_count} msgs, ~{token_est} tokens)\033[0m")
+
+
+GLOSSARY_PATH = V_AGENT_HOME / "glossary.json"
+
+
+def _load_glossary() -> str:
+    """加载业务术语表，返回格式化文本"""
+    if not GLOSSARY_PATH.exists():
+        return ""
+    try:
+        data = json.loads(GLOSSARY_PATH.read_text())
+        lines = [f"  {en} → {zh}" for en, zh in data.items()]
+        return "业务术语表 (回复时使用中文术语):\n" + "\n".join(lines)
+    except Exception:
+        return ""
 
 
 def build_system_prompt(skill_loader: SkillLoader) -> str:
-    return f"""你是一个编程助手，工作目录: {WORKDIR}。使用工具帮助用户解决问题。
-所有回复必须使用中文。
-可用技能 (使用 load_skill 加载): {skill_loader.descriptions()}
-执行操作前先说明计划。回答简洁。"""
+    glossary = _load_glossary()
+    glossary_section = f"\n{glossary}" if glossary else ""
+    return f"""你是一个专注于业务的编程助手，工作目录: {WORKDIR}。
+所有回复必须使用中文。回答简洁，执行操作前先说明计划。
+
+你的职责范围:
+- 使用工具 (bash, read_file, write_file, edit_file, list_dir, http_request) 帮助用户完成编程和业务任务
+- 通过已注册的接口工具 (apis) 查询和操作业务数据
+- 加载技能 (skills) 获取专业知识: {skill_loader.descriptions()}
+- 通过 RAG 知识库检索业务相关信息
+
+重要规则:
+- 只回答与上述职责相关的问题
+- 对于闲聊、天气、新闻、娱乐等与业务无关的问题，礼貌拒绝，例如: "抱歉，这个问题超出了我的业务范围，我只能帮你处理编程和业务相关的任务。"
+- 不要编造业务数据，如果不确定请使用工具查询{glossary_section}"""
+
+
+def _sanitize_messages(messages: list) -> list:
+    """构建脱敏副本，用于发送给 LLM。原始 messages 不变。"""
+    sanitized = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str):
+            sanitized.append({**msg, "content": sanitize_content(content)})
+        elif isinstance(content, list):
+            new_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    new_parts.append({**part, "content": sanitize_content(str(part.get("content", "")))})
+                else:
+                    # ContentBlock 对象 (tool_use/text) 原样保留
+                    new_parts.append(part)
+            sanitized.append({**msg, "content": new_parts})
+        else:
+            sanitized.append(msg)
+    return sanitized
 
 
 def agent_loop(messages: list, model_mgr: ModelManager,
@@ -111,10 +221,13 @@ def agent_loop(messages: list, model_mgr: ModelManager,
         # Layer 2: auto_compact
         ctx_mgr.auto_compact(messages)
 
-        # LLM 调用
-        _log_request(system_prompt, messages, model)
+        # 发送前统一脱敏: 构建脱敏副本，原始 messages 不变
+        sanitized = _sanitize_messages(messages)
+
+        # LLM 调用 (使用脱敏副本)
+        _log_request(system_prompt, sanitized, model, TOOLS, 8000)
         response = client.messages.create(
-            model=model, system=system_prompt, messages=messages,
+            model=model, system=system_prompt, messages=sanitized,
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
@@ -140,12 +253,10 @@ def agent_loop(messages: list, model_mgr: ModelManager,
                     except Exception as e:
                         output = f"Error: {e}"
                 print(f"\033[90m> {block.name}: {str(output)[:200]}\033[0m")
-                # 方向2: 出口脱敏，敏感信息不回传给模型
-                safe_output = sanitize_content(str(output))
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": safe_output
+                    "content": str(output)
                 })
 
         messages.append({"role": "user", "content": results})

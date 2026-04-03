@@ -115,8 +115,18 @@ class ModelManager:
         }
 
         self._save(config)
+        self._init_glossary()
         print(f"\n\033[32m配置完成! 默认模型: {model_id}\033[0m\n")
         return config
+
+    def _init_glossary(self):
+        """首次运行时创建术语表模板"""
+        glossary_path = V_AGENT_HOME / "glossary.json"
+        if not glossary_path.exists():
+            template = {
+                "_english_": "中文术语"
+            }
+            glossary_path.write_text(json.dumps(template, indent=2, ensure_ascii=False) + "\n")
 
     def _save(self, config: dict = None):
         if config is None:
