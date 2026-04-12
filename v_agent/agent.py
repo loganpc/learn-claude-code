@@ -2,6 +2,7 @@
 """V-Agent: 安全的命令行编程助手"""
 
 import json
+import logging
 import os
 import sys
 import time
@@ -9,6 +10,13 @@ from pathlib import Path
 
 # Add v_agent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    datefmt='%H:%M:%S'
+)
 
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.formatted_text import HTML
@@ -25,10 +33,12 @@ PROMPT_STYLE = Style.from_dict({
 })
 
 from config import ModelManager, V_AGENT_HOME
-from permissions import confirm_action, show_permissions, sanitize_content, load_redact_config, handle_redact_command
+from permissions import confirm_action, show_permissions, sanitize_content, load_redact_config, handle_redact_command, handle_permissions_command
 from context import ContextManager
 from rag import RAG
-from tools import TOOLS, TOOL_HANDLERS, SkillLoader, ApiLoader
+from tools import TOOLS, TOOL_HANDLERS, SkillLoader, _registry, _init_api_loader
+from api import call_with_retry, RetryConfig
+from logging_config import get_logger
 
 WORKDIR = Path.cwd()
 
@@ -43,6 +53,7 @@ APIS_DIR = V_AGENT_HOME / "apis"
 DEBUG_DIR = V_AGENT_HOME / "debug"
 _debug_enabled = False
 _api_loader = None
+_logger = None  # 全局日志实例
 
 # 命令补全定义
 COMMANDS = [
@@ -51,7 +62,7 @@ COMMANDS = [
     ("/models", "列出已配置的模型"),
     ("/compact", "手动压缩上下文"),
     ("/skills", "列出可用 skill"),
-    ("/permissions", "查看权限配置"),
+    ("/permissions", "查看/管理权限配置"),
     ("/redact", "查看脱敏规则"),
     ("/redact init", "交互式初始化脱敏规则"),
     ("/redact add keyword", "添加关键字脱敏"),
@@ -152,7 +163,10 @@ def _log_request(system_prompt: str, messages: list, model: str,
 
     with open(log_file, "a") as f:
         f.write("\n".join(lines))
-    print(f"\033[90m[debug] 请求已记录: {log_file} ({msg_count} msgs, ~{token_est} tokens)\033[0m")
+    if _logger:
+        _logger._main.debug(f"[debug] 请求已记录: {log_file} ({msg_count} msgs, ~{token_est} tokens)")
+    else:
+        print(f"\033[90m[debug] 请求已记录: {log_file} ({msg_count} msgs, ~{token_est} tokens)\033[0m")
 
 
 GLOSSARY_PATH = V_AGENT_HOME / "glossary.json"
@@ -224,12 +238,24 @@ def agent_loop(messages: list, model_mgr: ModelManager,
         # 发送前统一脱敏: 构建脱敏副本，原始 messages 不变
         sanitized = _sanitize_messages(messages)
 
-        # LLM 调用 (使用脱敏副本)
+        # LLM 调用 (使用脱敏副本 + 重试机制)
         _log_request(system_prompt, sanitized, model, TOOLS, 8000)
-        response = client.messages.create(
-            model=model, system=system_prompt, messages=sanitized,
-            tools=TOOLS, max_tokens=8000,
-        )
+        try:
+            response = call_with_retry(
+                client,
+                {
+                    "model": model,
+                    "system": system_prompt,
+                    "messages": sanitized,
+                    "tools": TOOLS,
+                    "max_tokens": 8000,
+                },
+                RetryConfig()
+            )
+        except Exception as e:
+            # API 调用失败，返回错误信息给用户
+            print(f"\n\033[31mAPI 调用失败: {e}\033[0m")
+            return
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason != "tool_use":
@@ -239,27 +265,89 @@ def agent_loop(messages: list, model_mgr: ModelManager,
                     print(f"\n{block.text}")
             return
 
-        # 工具执行
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                # 权限检查
-                if not confirm_action(block.name, block.input):
-                    output = "[用户拒绝执行]"
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    try:
-                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                    except Exception as e:
-                        output = f"Error: {e}"
-                print(f"\033[90m> {block.name}: {str(output)[:200]}\033[0m")
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(output)
-                })
-
+        # 工具执行（支持并行）
+        results = _execute_tools(response.content, TOOL_HANDLERS, _registry)
         messages.append({"role": "user", "content": results})
+
+
+def _execute_tools(content_blocks, tool_handlers, tool_registry):
+    """执行工具，只读工具并行，写操作串行"""
+    import time
+
+    # 收集所有工具调用
+    tool_calls = []
+    for block in content_blocks:
+        if block.type == "tool_use":
+            tool_calls.append(block)
+
+    if not tool_calls:
+        return []
+
+    # 单个工具：直接执行
+    if len(tool_calls) == 1:
+        return [_execute_one_tool(tool_calls[0], tool_handlers)]
+
+    # 多个工具：分类执行
+    read_only_calls = []
+    write_calls = []
+
+    for tc in tool_calls:
+        # 从注册表获取工具检查是否只读
+        tool = tool_registry.get(tc.name) if tool_registry else None
+        if tool and tool.is_read_only(tc.input):
+            read_only_calls.append(tc)
+        else:
+            write_calls.append(tc)
+
+    results = []
+
+    # 只读工具：并行执行
+    if read_only_calls:
+        start = time.time()
+        parallel_results = _execute_parallel(read_only_calls, tool_handlers)
+        results.extend(parallel_results)
+        duration = time.time() - start
+        if _logger:
+            _logger._main.debug(f"并行执行 {len(read_only_calls)} 个只读工具 ({duration:.2f}s)")
+
+    # 写操作：串行执行
+    for tc in write_calls:
+        results.append(_execute_one_tool(tc, tool_handlers))
+
+    return results
+
+
+def _execute_parallel(tool_calls, tool_handlers):
+    """并行执行多个工具"""
+    results = []
+    for tc in tool_calls:
+        result = _execute_one_tool(tc, tool_handlers)
+        results.append(result)
+    return results
+
+
+def _execute_one_tool(tool_call, tool_handlers):
+    """执行单个工具"""
+    tool_name = tool_call.name
+    tool_input = tool_call.input
+
+    # 权限检查
+    if not confirm_action(tool_name, tool_input):
+        output = "[用户拒绝执行]"
+    else:
+        handler = tool_handlers.get(tool_name)
+        try:
+            output = handler(**tool_input) if handler else f"Unknown tool: {tool_name}"
+        except Exception as e:
+            output = f"Error: {e}"
+
+    print(f"\033[90m> {tool_name}: {str(output)[:200]}\033[0m")
+
+    return {
+        "type": "tool_result",
+        "tool_use_id": tool_call.id,
+        "content": str(output)
+    }
 
 
 def handle_repl_command(cmd: str, model_mgr: ModelManager,
@@ -310,14 +398,17 @@ def handle_repl_command(cmd: str, model_mgr: ModelManager,
             print("暂无 skill")
         return True
 
-    if cmd == "/permissions":
-        show_permissions()
+    if cmd == "/permissions" or cmd.startswith("/permissions "):
+        permissions_args = cmd[12:].strip()
+        handle_permissions_command(permissions_args)
         return True
 
     if cmd == "/debug":
         global _debug_enabled
         _debug_enabled = not _debug_enabled
         status = "开启" if _debug_enabled else "关闭"
+        if _logger:
+            _logger._main.info(f"调试日志已{status}")
         print(f"\033[33m[调试日志已{status}]\033[0m")
         if _debug_enabled:
             print(f"日志目录: {DEBUG_DIR.resolve()}")
@@ -346,8 +437,10 @@ def handle_repl_command(cmd: str, model_mgr: ModelManager,
 
 def main():
     # 初始化
+    global _logger
     model_mgr = ModelManager()
     ctx_mgr = ContextManager()
+    _logger = get_logger(V_AGENT_HOME)
 
     # 把 config 中的 ak 同步到环境变量，供 API URL 模板使用
     if "ak" in model_mgr.config:
@@ -365,6 +458,7 @@ def main():
 
     # 加载自定义 API 工具
     global _api_loader
+    ApiLoader = _init_api_loader()
     _api_loader = ApiLoader(APIS_DIR)
     api_handlers, api_tools = _api_loader.load_all()
     TOOL_HANDLERS.update(api_handlers)
@@ -374,7 +468,10 @@ def main():
     for name in api_handlers:
         NEEDS_CONFIRM.add(name)
     if api_handlers:
-        print(f"\033[90m[已加载 {len(api_handlers)} 个接口工具]\033[0m")
+        if _logger:
+            _logger._main.info(f"已加载 {len(api_handlers)} 个接口工具")
+        else:
+            print(f"\033[90m[已加载 {len(api_handlers)} 个接口工具]\033[0m")
 
     system_prompt = build_system_prompt(skill_loader)
 

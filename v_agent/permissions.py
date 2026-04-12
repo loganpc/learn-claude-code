@@ -1,14 +1,61 @@
 # v_agent/permissions.py
 import json
 import re
+from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 
 from config import V_AGENT_HOME
 
-AUTO_APPROVE = {"read_file", "list_dir", "load_skill", "rag_query"}
-NEEDS_CONFIRM = {"bash", "write_file", "edit_file", "http_request"}
+# === 权限配置 ===
+PERMISSIONS_CONFIG_PATH = V_AGENT_HOME / "permissions.json"
+
+# 默认权限配置
+DEFAULT_PERMISSIONS = {
+    "auto_approve": ["read_file", "list_dir", "load_skill", "rag_query"],
+    "needs_confirm": ["bash", "write_file", "edit_file", "http_request"],
+    "denied_tools": [],
+    "path_rules": [
+        {"pattern": "/etc/*", "allow": False},
+        {"pattern": "*/.ssh/*", "allow": False}
+    ],
+    "denied_commands": ["rm -rf /*", "sudo rm *", "dd if=* of=/dev/*"]
+}
+
+# 加载权限配置
+def _load_permissions_config() -> dict:
+    """加载权限配置"""
+    if not PERMISSIONS_CONFIG_PATH.exists():
+        return DEFAULT_PERMISSIONS.copy()
+
+    try:
+        with open(PERMISSIONS_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"\033[31m[permissions] 配置加载失败: {e}\033[0m")
+        return DEFAULT_PERMISSIONS.copy()
+
+# 创建默认权限配置
+def _create_default_permissions():
+    """创建默认权限配置文件"""
+    if PERMISSIONS_CONFIG_PATH.exists():
+        return
+
+    PERMISSIONS_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(PERMISSIONS_CONFIG_PATH, 'w', encoding='utf-8') as f:
+        json.dump(DEFAULT_PERMISSIONS, f, indent=2, ensure_ascii=False)
+    print(f"\033[32m[permissions] 已创建默认配置: {PERMISSIONS_CONFIG_PATH}\033[0m")
+
+# 加载配置
+_permissions_config = _load_permissions_config()
+AUTO_APPROVE = set(_permissions_config.get("auto_approve", []))
+NEEDS_CONFIRM = set(_permissions_config.get("needs_confirm", []))
+DENIED_TOOLS = set(_permissions_config.get("denied_tools", []))
+PATH_RULES = _permissions_config.get("path_rules", [])
+DENIED_COMMANDS = _permissions_config.get("denied_commands", [])
 
 _session_approved: set = set()  # 预留，暂不启用
+
 
 # === 方向1: 敏感文件拦截 ===
 SENSITIVE_FILE_PATTERNS = [
@@ -169,7 +216,47 @@ def sanitize_content(text: str) -> str:
     return text
 
 
-# === /redact 子命令 ===
+# === /permissions 子命令 ===
+
+def show_permissions():
+    """显示当前权限配置"""
+    print("\n\033[36m[权限配置]\033[0m")
+    print(f"  自动执行: {', '.join(sorted(AUTO_APPROVE))}")
+    print(f"  需要确认: {', '.join(sorted(NEEDS_CONFIRM))}")
+    print(f"  已禁用工具: {', '.join(sorted(DENIED_TOOLS)) or '(无)'}")
+
+    if PATH_RULES:
+        print(f"  路径规则:")
+        for rule in PATH_RULES:
+            status = "\033[32m允许\033[0m" if rule.get("allow") else "\033[31m拒绝\033[0m"
+            print(f"    - {rule['pattern']}: {status}")
+    else:
+        print(f"  路径规则: (无)")
+
+    if DENIED_COMMANDS:
+        print(f"  命令拒绝规则: {', '.join(DENIED_COMMANDS)}")
+    else:
+        print(f"  命令拒绝规则: (无)")
+
+    print(f"\n配置文件: {PERMISSIONS_CONFIG_PATH}")
+
+
+def handle_permissions_command(args: str) -> bool:
+    """处理 /permissions 子命令，返回 True 表示已处理"""
+    args = args.strip()
+
+    if args == "" or args == "show":
+        show_permissions()
+        return True
+
+    print("用法:")
+    print("  /permissions              查看当前配置")
+    print("  /permissions show         同上")
+    # 更多子命令可以后续添加
+    return True
+
+
+# === /redact 子命令 (保持不变) ===
 
 def redact_init():
     """交互式初始化脱敏配置"""
@@ -355,12 +442,37 @@ def handle_redact_command(args: str) -> bool:
     return True
 
 
+# === 权限检查 ===
+
 def grant_session_permission(tool_name: str):
     """预留接口，后续可扩展"""
     _session_approved.add(tool_name)
 
+
 def confirm_action(tool_name: str, params: dict) -> bool:
     """交互式确认，返回 True 执行，False 跳过"""
+    # 检查是否被禁用
+    if tool_name in DENIED_TOOLS:
+        print(f"\033[31m[权限拒绝] {tool_name} 已被禁用\033[0m")
+        return False
+
+    # 检查路径规则
+    if "path" in params:
+        file_path = params["path"]
+        for rule in PATH_RULES:
+            if fnmatch.fnmatch(file_path, rule["pattern"]):
+                if not rule.get("allow", True):
+                    print(f"\033[31m[权限拒绝] 路径匹配拒绝规则: {rule['pattern']}\033[0m")
+                    return False
+
+    # 检查命令拒绝规则
+    if tool_name == "bash":
+        command = params.get("command", "")
+        for pattern in DENIED_COMMANDS:
+            if fnmatch.fnmatch(command, pattern):
+                print(f"\033[31m[权限拒绝] 命令匹配拒绝规则: {pattern}\033[0m")
+                return False
+
     # 方向1: read_file 遇到敏感文件，降级为需要确认
     if tool_name == "read_file" and _is_sensitive_file(params.get("path", "")):
         print(f"\n\033[31m[敏感文件] {params['path']}\033[0m")
@@ -388,10 +500,13 @@ def confirm_action(tool_name: str, params: dict) -> bool:
         elif ans == 'n':
             return False
 
-def show_permissions():
-    """显示当前权限配置"""
-    print("\n自动执行:", ", ".join(sorted(AUTO_APPROVE)))
-    print("需要确认:", ", ".join(sorted(NEEDS_CONFIRM)))
-    print("敏感文件:", ", ".join(SENSITIVE_FILE_PATTERNS))
-    if _session_approved:
-        print("会话授权:", ", ".join(sorted(_session_approved)))
+
+def _reload_permissions():
+    """重新加载权限配置"""
+    global _permissions_config, AUTO_APPROVE, NEEDS_CONFIRM, DENIED_TOOLS, PATH_RULES, DENIED_COMMANDS
+    _permissions_config = _load_permissions_config()
+    AUTO_APPROVE = set(_permissions_config.get("auto_approve", []))
+    NEEDS_CONFIRM = set(_permissions_config.get("needs_confirm", []))
+    DENIED_TOOLS = set(_permissions_config.get("denied_tools", []))
+    PATH_RULES = _permissions_config.get("path_rules", [])
+    DENIED_COMMANDS = _permissions_config.get("denied_commands", [])

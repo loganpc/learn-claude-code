@@ -63,7 +63,14 @@ class ModelManager:
         if CONFIG_PATH.exists():
             return json.loads(CONFIG_PATH.read_text())
         print("\033[36m检测到首次运行，请配置模型...\033[0m\n")
-        return self._interactive_setup()
+        config = self._interactive_setup()
+        self._create_default_permissions()
+        return config
+
+    def _create_default_permissions(self):
+        """创建默认权限配置"""
+        from permissions import _create_default_permissions
+        _create_default_permissions()
 
     def _interactive_setup(self) -> dict:
         config = {"default_model": None, "models": {}, "rag": {"enabled": False, "endpoint": ""}, "ak": "vplus:agent:tools:sk:00001"}
